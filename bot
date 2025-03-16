@@ -1,0 +1,389 @@
+import asyncio
+import platform
+import time
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional
+
+import aiohttp
+import psutil
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramAPIError
+
+# Configuration
+API_TOKEN = "7373428920:AAFYXy5o-_S6Cy1BbT6KANJWLHMH8Xf1w1U"
+CHAT_ID = "-1002355040050"
+THREAD_ID = 771
+HEALTH_CHECK_URL = "http://127.0.0.1:3000/health/check"
+CHECK_INTERVAL = 300  # 5 minutes
+
+# Initialize bot
+bot = Bot(
+    token=API_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
+)
+dp = Dispatcher()
+
+# System metrics collection
+class SystemMonitor:
+    @staticmethod
+    async def get_system_metrics() -> Dict[str, Any]:
+        cpu_usage = psutil.cpu_percent(interval=0.5)
+        virtual_memory = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+        
+        metrics = {
+            "cpu": {
+                "usage": cpu_usage,
+                "cores": psutil.cpu_count(logical=True),
+                "physical_cores": psutil.cpu_count(logical=False)
+            },
+            "memory": {
+                "total": virtual_memory.total / (1024 ** 3),
+                "used": virtual_memory.used / (1024 ** 3),
+                "percent": virtual_memory.percent
+            },
+            "disk": {
+                "total": disk.total / (1024 ** 3),
+                "used": disk.used / (1024 ** 3),
+                "percent": disk.percent
+            },
+            "system": {
+                "platform": platform.system(),
+                "version": platform.version(),
+                "machine": platform.machine(),
+                "hostname": platform.node(),
+                "boot_time": datetime.fromtimestamp(psutil.boot_time()).strftime("%Y-%m-%d %H:%M:%S"),
+                "uptime": str(timedelta(seconds=int(time.time() - psutil.boot_time())))
+            },
+            "network": {
+                "connections": len(psutil.net_connections())
+            },
+            "processes": {
+                "count": len(psutil.pids())
+            },
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        return metrics
+
+# API client
+class ServiceClient:
+    @staticmethod
+    async def check_health() -> Dict[str, Any]:
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(HEALTH_CHECK_URL, timeout=5) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    return {"error": f"Status code: {response.status}"}
+            except aiohttp.ClientError as e:
+                return {"error": f"Connection error: {str(e)}"}
+            except asyncio.TimeoutError:
+                return {"error": "Request timed out"}
+
+# Message formatter
+class MessageFormatter:
+    @staticmethod
+    def format_status_message(service_data: Dict[str, Any], system_data: Dict[str, Any]) -> str:
+        if "error" in service_data:
+            service_status = f"⚠️ **Service Unavailable**: {service_data['error']}"
+        else:
+            timestamp = service_data.get("timestamp", "Unknown")
+            uptime = round(service_data.get("uptime", 0) / 60, 2)
+            environment = service_data.get("environment", "Unknown")
+            
+            memory = service_data.get("memoryUsage", {})
+            rss = memory.get("rss", "Unknown")
+            heap_total = memory.get("heapTotal", "Unknown")
+            heap_used = memory.get("heapUsed", "Unknown")
+            
+            service_status = (
+                f"**🟢 Service Status**\n"
+                f"**Time**: `{timestamp}`\n"
+                f"**Uptime**: `{uptime} minutes`\n"
+                f"**Environment**: `{environment}`\n\n"
+                f"**Memory Usage**:\n"
+                f"  - RSS: `{rss}`\n"
+                f"  - Heap Total: `{heap_total}`\n"
+                f"  - Heap Used: `{heap_used}`\n"
+            )
+        
+        system_status = (
+            f"**🖥️ System Status** (`{system_data['system']['hostname']}`)\n"
+            f"**Platform**: `{system_data['system']['platform']} {system_data['system']['machine']}`\n"
+            f"**Uptime**: `{system_data['system']['uptime']}`\n\n"
+            f"**CPU Usage**: `{system_data['cpu']['usage']}%` ({system_data['cpu']['physical_cores']}/{system_data['cpu']['cores']} cores)\n"
+            f"**Memory**: `{system_data['memory']['used']:.2f}GB/{system_data['memory']['total']:.2f}GB` ({system_data['memory']['percent']}%)\n"
+            f"**Disk**: `{system_data['disk']['used']:.2f}GB/{system_data['disk']['total']:.2f}GB` ({system_data['disk']['percent']}%)\n"
+            f"**Processes**: `{system_data['processes']['count']}`\n"
+            f"**Network Connections**: `{system_data['network']['connections']}`\n"
+            f"**Time**: `{system_data['timestamp']}`"
+        )
+        
+        return f"{service_status}\n\n{system_status}"
+
+# Command handlers
+@dp.message(Command("help"))
+async def help_command(message: types.Message):
+    help_text = (
+        "🤖 **Available Commands**:\n\n"
+        "🔹 `/check` - Check server status\n"
+        "🔹 `/system` - System information only\n"
+        "🔹 `/service` - Service information only\n"
+        "🔹 `/help` - Show this help message\n"
+    )
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="Check Status", callback_data="check_status")
+    keyboard.button(text="System Info", callback_data="system_info")
+    
+    await message.answer(help_text, reply_markup=keyboard.as_markup())
+
+@dp.message(Command("check"))
+async def check_command(message: types.Message):
+    await message.answer("⏳ Checking status...")
+    
+    system_data = await SystemMonitor.get_system_metrics()
+    service_data = await ServiceClient.check_health()
+    
+    status_message = MessageFormatter.format_status_message(service_data, system_data)
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="🔄 Refresh", callback_data="refresh_status")
+    
+    await message.answer(status_message, reply_markup=keyboard.as_markup())
+
+@dp.message(Command("system"))
+async def system_command(message: types.Message):
+    await message.answer("⏳ Collecting system information...")
+    
+    system_data = await SystemMonitor.get_system_metrics()
+    
+    system_status = (
+        f"**🖥️ System Status** (`{system_data['system']['hostname']}`)\n"
+        f"**Platform**: `{system_data['system']['platform']} {system_data['system']['machine']}`\n"
+        f"**Version**: `{system_data['system']['version']}`\n"
+        f"**Boot Time**: `{system_data['system']['boot_time']}`\n"
+        f"**Uptime**: `{system_data['system']['uptime']}`\n\n"
+        f"**CPU Usage**: `{system_data['cpu']['usage']}%` ({system_data['cpu']['physical_cores']}/{system_data['cpu']['cores']} cores)\n"
+        f"**Memory**: `{system_data['memory']['used']:.2f}GB/{system_data['memory']['total']:.2f}GB` ({system_data['memory']['percent']}%)\n"
+        f"**Disk**: `{system_data['disk']['used']:.2f}GB/{system_data['disk']['total']:.2f}GB` ({system_data['disk']['percent']}%)\n"
+        f"**Processes**: `{system_data['processes']['count']}`\n"
+        f"**Network Connections**: `{system_data['network']['connections']}`\n"
+        f"**Time**: `{system_data['timestamp']}`"
+    )
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="🔄 Refresh System Info", callback_data="refresh_system")
+    
+    await message.answer(system_status, reply_markup=keyboard.as_markup())
+
+@dp.message(Command("service"))
+async def service_command(message: types.Message):
+    await message.answer("⏳ Checking service status...")
+    
+    service_data = await ServiceClient.check_health()
+    
+    if "error" in service_data:
+        service_status = f"⚠️ **Service Unavailable**: {service_data['error']}"
+    else:
+        timestamp = service_data.get("timestamp", "Unknown")
+        uptime = round(service_data.get("uptime", 0) / 60, 2)
+        environment = service_data.get("environment", "Unknown")
+        
+        memory = service_data.get("memoryUsage", {})
+        rss = memory.get("rss", "Unknown")
+        heap_total = memory.get("heapTotal", "Unknown")
+        heap_used = memory.get("heapUsed", "Unknown")
+        
+        service_status = (
+            f"**🟢 Service Status**\n"
+            f"**Time**: `{timestamp}`\n"
+            f"**Uptime**: `{uptime} minutes`\n"
+            f"**Environment**: `{environment}`\n\n"
+            f"**Memory Usage**:\n"
+            f"  - RSS: `{rss}`\n"
+            f"  - Heap Total: `{heap_total}`\n"
+            f"  - Heap Used: `{heap_used}`\n"
+        )
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="🔄 Refresh Service", callback_data="refresh_service")
+    
+    await message.answer(service_status, reply_markup=keyboard.as_markup())
+
+# Callback query handlers
+@dp.callback_query(F.data == "check_status")
+async def check_status_callback(callback: types.CallbackQuery):
+    await callback.answer("Checking status...")
+    
+    system_data = await SystemMonitor.get_system_metrics()
+    service_data = await ServiceClient.check_health()
+    
+    status_message = MessageFormatter.format_status_message(service_data, system_data)
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="🔄 Refresh", callback_data="refresh_status")
+    
+    await callback.message.edit_text(status_message, reply_markup=keyboard.as_markup())
+
+@dp.callback_query(F.data == "refresh_status")
+async def refresh_status_callback(callback: types.CallbackQuery):
+    await callback.answer("Refreshing status...")
+    
+    system_data = await SystemMonitor.get_system_metrics()
+    service_data = await ServiceClient.check_health()
+    
+    status_message = MessageFormatter.format_status_message(service_data, system_data)
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="🔄 Refresh", callback_data="refresh_status")
+    
+    await callback.message.edit_text(status_message, reply_markup=keyboard.as_markup())
+
+@dp.callback_query(F.data == "system_info")
+async def system_info_callback(callback: types.CallbackQuery):
+    await callback.answer("Getting system info...")
+    
+    system_data = await SystemMonitor.get_system_metrics()
+    
+    system_status = (
+        f"**🖥️ System Status** (`{system_data['system']['hostname']}`)\n"
+        f"**Platform**: `{system_data['system']['platform']} {system_data['system']['machine']}`\n"
+        f"**Version**: `{system_data['system']['version']}`\n"
+        f"**Boot Time**: `{system_data['system']['boot_time']}`\n"
+        f"**Uptime**: `{system_data['system']['uptime']}`\n\n"
+        f"**CPU Usage**: `{system_data['cpu']['usage']}%` ({system_data['cpu']['physical_cores']}/{system_data['cpu']['cores']} cores)\n"
+        f"**Memory**: `{system_data['memory']['used']:.2f}GB/{system_data['memory']['total']:.2f}GB` ({system_data['memory']['percent']}%)\n"
+        f"**Disk**: `{system_data['disk']['used']:.2f}GB/{system_data['disk']['total']:.2f}GB` ({system_data['disk']['percent']}%)\n"
+        f"**Processes**: `{system_data['processes']['count']}`\n"
+        f"**Network Connections**: `{system_data['network']['connections']}`\n"
+        f"**Time**: `{system_data['timestamp']}`"
+    )
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="🔄 Refresh System Info", callback_data="refresh_system")
+    
+    await callback.message.edit_text(system_status, reply_markup=keyboard.as_markup())
+
+@dp.callback_query(F.data == "refresh_system")
+async def refresh_system_callback(callback: types.CallbackQuery):
+    await callback.answer("Refreshing system info...")
+    
+    system_data = await SystemMonitor.get_system_metrics()
+    
+    system_status = (
+        f"**🖥️ System Status** (`{system_data['system']['hostname']}`)\n"
+        f"**Platform**: `{system_data['system']['platform']} {system_data['system']['machine']}`\n"
+        f"**Version**: `{system_data['system']['version']}`\n"
+        f"**Boot Time**: `{system_data['system']['boot_time']}`\n"
+        f"**Uptime**: `{system_data['system']['uptime']}`\n\n"
+        f"**CPU Usage**: `{system_data['cpu']['usage']}%` ({system_data['cpu']['physical_cores']}/{system_data['cpu']['cores']} cores)\n"
+        f"**Memory**: `{system_data['memory']['used']:.2f}GB/{system_data['memory']['total']:.2f}GB` ({system_data['memory']['percent']}%)\n"
+        f"**Disk**: `{system_data['disk']['used']:.2f}GB/{system_data['disk']['total']:.2f}GB` ({system_data['disk']['percent']}%)\n"
+        f"**Processes**: `{system_data['processes']['count']}`\n"
+        f"**Network Connections**: `{system_data['network']['connections']}`\n"
+        f"**Time**: `{system_data['timestamp']}`"
+    )
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="🔄 Refresh System Info", callback_data="refresh_system")
+    
+    await callback.message.edit_text(system_status, reply_markup=keyboard.as_markup())
+
+@dp.callback_query(F.data == "refresh_service")
+async def refresh_service_callback(callback: types.CallbackQuery):
+    await callback.answer("Refreshing service status...")
+    
+    service_data = await ServiceClient.check_health()
+    
+    if "error" in service_data:
+        service_status = f"⚠️ **Service Unavailable**: {service_data['error']}"
+    else:
+        timestamp = service_data.get("timestamp", "Unknown")
+        uptime = round(service_data.get("uptime", 0) / 60, 2)
+        environment = service_data.get("environment", "Unknown")
+        
+        memory = service_data.get("memoryUsage", {})
+        rss = memory.get("rss", "Unknown")
+        heap_total = memory.get("heapTotal", "Unknown")
+        heap_used = memory.get("heapUsed", "Unknown")
+        
+        service_status = (
+            f"**🟢 Service Status**\n"
+            f"**Time**: `{timestamp}`\n"
+            f"**Uptime**: `{uptime} minutes`\n"
+            f"**Environment**: `{environment}`\n\n"
+            f"**Memory Usage**:\n"
+            f"  - RSS: `{rss}`\n"
+            f"  - Heap Total: `{heap_total}`\n"
+            f"  - Heap Used: `{heap_used}`\n"
+        )
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="🔄 Refresh Service", callback_data="refresh_service")
+    
+    await callback.message.edit_text(service_status, reply_markup=keyboard.as_markup())
+
+# Automated monitoring
+async def scheduled_check():
+    while True:
+        try:
+            system_data = await SystemMonitor.get_system_metrics()
+            service_data = await ServiceClient.check_health()
+            
+            status_message = MessageFormatter.format_status_message(service_data, system_data)
+            
+            # Check if there are critical issues to report
+            critical_issues = []
+            
+            # CPU check
+            if system_data['cpu']['usage'] > 90:
+                critical_issues.append(f"⚠️ **High CPU Usage**: {system_data['cpu']['usage']}%")
+            
+            # Memory check
+            if system_data['memory']['percent'] > 90:
+                critical_issues.append(f"⚠️ **High Memory Usage**: {system_data['memory']['percent']}%")
+            
+            # Disk check
+            if system_data['disk']['percent'] > 90:
+                critical_issues.append(f"⚠️ **Low Disk Space**: {system_data['disk']['percent']}%")
+            
+            # Service check
+            if "error" in service_data:
+                critical_issues.append(f"⚠️ **Service Down**: {service_data['error']}")
+            
+            # If there are critical issues, send an alert
+            if critical_issues:
+                alert_message = "🚨 **SYSTEM ALERT**\n\n" + "\n".join(critical_issues) + f"\n\n{status_message}"
+                await bot.send_message(chat_id=CHAT_ID, text=alert_message, message_thread_id=THREAD_ID)
+        
+        except Exception as e:
+            try:
+                error_message = f"⚠️ **Monitoring Error**: {str(e)}"
+                await bot.send_message(chat_id=CHAT_ID, text=error_message, message_thread_id=THREAD_ID)
+            except TelegramAPIError:
+                pass
+        
+        await asyncio.sleep(CHECK_INTERVAL)
+
+# Legacy command handler (for backward compatibility)
+@dp.message(Command("checkFincho"))
+async def legacy_check_command(message: types.Message):
+    await message.answer("ℹ️ This command has been renamed. Please use `/check` instead.")
+    await check_command(message)
+
+# Main function
+async def main():
+    # Start the monitoring task
+    asyncio.create_task(scheduled_check())
+    
+    # Start polling
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
