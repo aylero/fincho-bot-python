@@ -18,7 +18,13 @@ API_TOKEN = "7373428920:AAFYXy5o-_S6Cy1BbT6KANJWLHMH8Xf1w1U"
 CHAT_ID = "-1002355040050"
 THREAD_ID = 771
 HEALTH_CHECK_URL = "http://127.0.0.1:3000/health/check"
-CHECK_INTERVAL = 300  # 5 minutes
+
+# Monitoring configuration
+CHECK_INTERVAL = 86400  # 24 hours (in seconds) for regular status updates
+MONITORING_INTERVAL = 20  # Check every 20 seconds
+CRITICAL_CPU_THRESHOLD = 90  # CPU usage percentage threshold for alerts
+CRITICAL_MEMORY_THRESHOLD = 90  # Memory usage percentage threshold for alerts
+CRITICAL_DISK_THRESHOLD = 90  # Disk usage percentage threshold for alerts
 
 # Initialize bot
 bot = Bot(
@@ -329,38 +335,75 @@ async def refresh_service_callback(callback: types.CallbackQuery):
     
     await callback.message.edit_text(service_status, reply_markup=keyboard.as_markup())
 
+# Track the last time we sent a status update
+last_status_update = datetime.now() - timedelta(minutes=10)  # Initialize to ensure first update runs
+last_alert_time = {}  # Dictionary to track when each type of alert was last sent
+
 # Automated monitoring
 async def scheduled_check():
+    global last_status_update
+    global last_alert_time
+    
     while True:
         try:
             system_data = await SystemMonitor.get_system_metrics()
             service_data = await ServiceClient.check_health()
             
-            status_message = MessageFormatter.format_status_message(service_data, system_data)
-            
             # Check if there are critical issues to report
             critical_issues = []
             
             # CPU check
-            if system_data['cpu']['usage'] > 90:
+            if system_data['cpu']['usage'] > CRITICAL_CPU_THRESHOLD:
                 critical_issues.append(f"⚠️ **High CPU Usage**: {system_data['cpu']['usage']}%")
             
             # Memory check
-            if system_data['memory']['percent'] > 90:
+            if system_data['memory']['percent'] > CRITICAL_MEMORY_THRESHOLD:
                 critical_issues.append(f"⚠️ **High Memory Usage**: {system_data['memory']['percent']}%")
             
             # Disk check
-            if system_data['disk']['percent'] > 90:
+            if system_data['disk']['percent'] > CRITICAL_DISK_THRESHOLD:
                 critical_issues.append(f"⚠️ **Low Disk Space**: {system_data['disk']['percent']}%")
             
             # Service check
             if "error" in service_data:
                 critical_issues.append(f"⚠️ **Service Down**: {service_data['error']}")
             
-            # If there are critical issues, send an alert
+            # Format the status message only if we need to send it
+            status_message = None
+            
+            # If there are critical issues, send an alert immediately
+            current_time = datetime.now()
+            
             if critical_issues:
-                alert_message = "🚨 **SYSTEM ALERT**\n\n" + "\n".join(critical_issues) + f"\n\n{status_message}"
-                await bot.send_message(chat_id=CHAT_ID, text=alert_message, message_thread_id=THREAD_ID)
+                # Create a unique key for this set of issues
+                issue_key = "|".join(sorted(critical_issues))
+                
+                # Only send alert if we haven't sent one for these issues in the last hour
+                if issue_key not in last_alert_time or (current_time - last_alert_time[issue_key]).total_seconds() > 3600:
+                    if status_message is None:
+                        status_message = MessageFormatter.format_status_message(service_data, system_data)
+                    
+                    alert_message = "🚨 **SYSTEM ALERT**\n\n" + "\n".join(critical_issues) + f"\n\n{status_message}"
+                    await bot.send_message(chat_id=CHAT_ID, text=alert_message, message_thread_id=THREAD_ID)
+                    
+                    # Update the last alert time for this issue
+                    last_alert_time[issue_key] = current_time
+            
+            # Send regular status updates every CHECK_INTERVAL seconds (e.g., once per day)
+            if (current_time - last_status_update).total_seconds() >= CHECK_INTERVAL:
+                if status_message is None:
+                    status_message = MessageFormatter.format_status_message(service_data, system_data)
+                
+                keyboard = InlineKeyboardBuilder()
+                keyboard.button(text="🔄 Refresh", callback_data="refresh_status")
+                
+                await bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=f"📊 **Daily Status Update**\n\n{status_message}",
+                    reply_markup=keyboard.as_markup(),
+                    message_thread_id=THREAD_ID
+                )
+                last_status_update = current_time  # Update the timestamp
         
         except Exception as e:
             try:
@@ -369,7 +412,8 @@ async def scheduled_check():
             except TelegramAPIError:
                 pass
         
-        await asyncio.sleep(CHECK_INTERVAL)
+        # Check more frequently (every MONITORING_INTERVAL seconds)
+        await asyncio.sleep(MONITORING_INTERVAL)
 
 # Legacy command handler (for backward compatibility)
 @dp.message(Command("checkFincho"))
