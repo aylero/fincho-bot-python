@@ -26,7 +26,7 @@ ADMIN_USERNAMES = ["alireza10up", "Sajad_mhri", "Grayorc"]
 
 # Monitoring configuration
 CHECK_INTERVAL = 86400  # 24 hours (in seconds) for regular status updates
-MONITORING_INTERVAL = 20  # Check every 20 seconds
+MONITORING_INTERVAL = 10  # Check every 10 seconds
 CRITICAL_CPU_THRESHOLD = 90  # CPU usage percentage threshold for alerts
 CRITICAL_MEMORY_THRESHOLD = 90  # Memory usage percentage threshold for alerts
 CRITICAL_DISK_THRESHOLD = 90  # Disk usage percentage threshold for alerts
